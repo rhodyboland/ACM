@@ -76,17 +76,19 @@ bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
 // Configuration and Status Variables
-float cutOutVoltage = 12.0;
-float cutInVoltage = 12.4;
+float critVoltage = 10.0;
+float cutOutVoltage = 11.8;
+float cutInVoltage = 12.2;
 bool autoCutoffEnabled = true;
 bool alwaysOnChannels[10] = {false, false, false, false, false, false, false, false, false, false};
+bool priorityChannels[10] = {false, false, false, false, false, false, false, false, false, false}; // Priority channels
 bool lowCurrentStates[8] = {false, false, false, false, false, false, false, false};
 bool mediumCurrentStates[2] = {false, false};
 int lowCurrentBrightness[8] = {255, 255, 255, 255, 255, 255, 255, 255};
 
 // Voltage divider ratio and calibration factor for voltage sensing
 const float voltageDividerRatio = 5.68;
-const float voltageCalibrationFactor = 1.01975;
+const float voltageCalibrationFactor = 1.00;
 
 // Rolling average buffer for voltage readings
 const int voltageBufferSize = 10;
@@ -94,10 +96,21 @@ float voltageBuffer[voltageBufferSize] = {0.0};
 int voltageBufferIndex = 0;
 unsigned long lastVoltageReadMillis = 0; // Last voltage read timestamp
 
+const int currentBufferSize = 10; // Rolling average size for current values
+
+// Buffers to store last 10 current readings for each channel
+float lowCurrentBuffers[8][currentBufferSize] = {0};
+int lowCurrentIndex[8] = {0};
+
+// Buffers to store last 10 current readings for each medium current channel
+float mediumCurrentBuffers[2][currentBufferSize] = {0};
+int mediumCurrentIndex[2] = {0};
+
 bool errorPresent = false;
 int errorCode = 0;
 bool outputsDisabled = false;
-float batteryVoltage = 12.5; // Initial battery voltage
+float batteryVoltage = 0; // Initial battery voltage
+float totatlCurrent = 0;
 
 // ----- Function Prototypes -----
 void setLEDColor(char color);
@@ -118,68 +131,7 @@ float readQuadCurrent(int channel, int selectPin, int sensePin);
 float readDualCurrent(int channel);
 void applyConfiguration(const std::string &config);
 
-class MyCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-        deviceConnected = true;
-        handleConnectionIndicator(); // New device connected
-    }
-
-    void onDisconnect(BLEServer* pServer) {
-        deviceConnected = false;
-        // Start advertising again
-        BLEDevice::startAdvertising();
-        flashLED('R', 1, 250); // Device disconnected
-    }
-};
-
-class CharacteristicCallbacks : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string value = pCharacteristic->getValue().c_str();
-        if (value.length() > 0) {
-            Serial.print("Received command: ");
-            Serial.println(value.c_str());
-            handleCommandReceivedIndicator(); // Command received
-
-            char command = value[0];
-            switch (command) {
-                case 'L': { // Control low current channels
-                    int lcIndex = value[1] - '1';
-                    lowCurrentStates[lcIndex] = (value[2] == '1');
-                    digitalWrite(getLowCurrentPin(lcIndex + 1), lowCurrentStates[lcIndex] ? HIGH : LOW);
-                    break;
-                }
-                case 'M': { // Control medium current channels
-                    int mcIndex = value[1] - '1';
-                    mediumCurrentStates[mcIndex] = (value[2] == '1');
-                    digitalWrite(getMediumCurrentPin(mcIndex + 1), mediumCurrentStates[mcIndex] ? HIGH : LOW);
-                    break;
-                }
-                case 'B': { // Set brightness for low current outputs
-                    int lcIndex = value[1] - '1';
-                    lowCurrentBrightness[lcIndex] = std::stoi(value.substr(2));
-                    if (lowCurrentStates[lcIndex]) {
-                        analogWrite(getLowCurrentPin(lcIndex + 1), lowCurrentBrightness[lcIndex]);
-                    }
-                    break;
-                }
-                case 'E': { // Error indicator command
-                    int code = std::stoi(value.substr(1));
-                    handleErrorIndicator(code);
-                    break;
-                }
-                case 'C': { // Configuration command
-                    applyConfiguration(value);
-                    break;
-                }
-                default:
-                    handleErrorIndicator(1); // Unknown command error
-                    break;
-            }
-        }
-    }
-};
-
-// Function to get the low current pin based on index
+// Function to get the corresponding pin for low current channels
 int getLowCurrentPin(int index) {
     switch (index) {
         case 1: return LC1;
@@ -194,7 +146,7 @@ int getLowCurrentPin(int index) {
     }
 }
 
-// Function to get the medium current pin based on index
+// Function to get the corresponding pin for medium current channels
 int getMediumCurrentPin(int index) {
     switch (index) {
         case 1: return MC1;
@@ -203,90 +155,124 @@ int getMediumCurrentPin(int index) {
     }
 }
 
-// Function to read the real voltage from the voltage divider
+// Function to read and calculate the real voltage from the V_SENSE pin
 float readRealVoltage() {
-    int adcValue = analogRead(V_SENSE);
-    float measuredVoltage = (adcValue * 3.3) / 4095.0;
-    float inputVoltage = measuredVoltage * voltageDividerRatio * voltageCalibrationFactor;
-    voltageBuffer[voltageBufferIndex] = inputVoltage;
-    voltageBufferIndex = (voltageBufferIndex + 1) % voltageBufferSize;
+    // Read the analog value from the voltage sense pin
+    int analogValue = analogRead(V_SENSE);
+    
+    // Convert the analog value to a voltage in volts
+    float measuredVoltage = (analogValue * 3.3 / 4095.0) * voltageDividerRatio;
+    
+    // Apply the calibration factor for fine-tuning
+    return measuredVoltage * voltageCalibrationFactor;
+}
 
-    float sum = 0.0;
-    for (int i = 0; i < voltageBufferSize; i++) {
-        sum += voltageBuffer[i];
-    }
-    return sum / voltageBufferSize;
+
+
+// Function to convert a float to a hex string (2 bytes for voltage/current)
+String floatToHex(float value, int scale) {
+    return String((int)(value * scale), HEX);
+}
+
+// Function to convert a state to a hex string (1 or 0)
+String stateToHex(bool state) {
+    return state ? "1" : "0";
 }
 
 // Function to send sensor data over BLE
 void sendSensorData() {
-    float voltage = batteryVoltage; // Use last read battery voltage
-    float current = 5.67;
-    bool solarCharging = true;
-    float solarPower = 100.0;
-    float solarVoltage = 24.0;
-    float solarCurrent = 4.0;
+    // Voltage and Current (Hex representation)
+    String batteryVoltageHex = floatToHex(batteryVoltage, 100); // Voltage scaled by 100 (e.g., 12.34 -> 0C4A)
+    String solarVoltageHex = floatToHex(24.0, 100);
+    String solarCurrentHex = floatToHex(4.0, 100);
+    String solarPowerHex = floatToHex(100.0, 100);    
 
-    mcp.digitalWrite(Q1_SEn, HIGH);
-    float lowCurrents[4];
-    for (int i = 0; i < 4; i++) {
-        lowCurrents[i] = readQuadCurrent(i, Q1_SEL0, Q1_CS);
+    // Load Channels (Low current)
+    String loadChannelsSection = "L:";
+    for (int i = 0; i < 8; i++) {
+        String stateHex = stateToHex(lowCurrentStates[i]);
+        String brightnessHex = String(lowCurrentBrightness[i], HEX); // Brightness in hex
+        float current = (i < 4) ? readQuadCurrent(i, Q1_SEL0, Q1_CS) : readQuadCurrent(i - 4, Q2_SEL0, Q2_CS); // Current for each channel
+        String currentHex = floatToHex(current, 1000); // Current scaled by 1000 (e.g., 449.28 -> 1C1A)
+        loadChannelsSection += stateHex + brightnessHex + currentHex + ((i < 7) ? "," : ";"); // Comma separated
     }
-    mcp.digitalWrite(Q1_SEn, LOW);
 
-    mcp.digitalWrite(Q2_SEn, HIGH);
-    for (int i = 4; i < 8; i++) {
-        lowCurrents[i] = readQuadCurrent(i - 4, Q2_SEL0, Q2_CS);
-    }
-    mcp.digitalWrite(Q2_SEn, LOW);
-
-    mcp.digitalWrite(D_SEn, HIGH);
-    float mediumCurrents[2];
+    // Medium Current Channels
+    String mediumChannelsSection = "M:";
     for (int i = 0; i < 2; i++) {
-        mediumCurrents[i] = readDualCurrent(i);
+        String stateHex = stateToHex(mediumCurrentStates[i]);
+        float current = readDualCurrent(i); // Current for medium channels
+        String currentHex = floatToHex(current, 1000);
+        mediumChannelsSection += stateHex + currentHex + ((i < 1) ? "," : ";");
     }
-    mcp.digitalWrite(D_SEn, LOW);
 
-    char buffer[512]; // Increased buffer size to accommodate all values
-    snprintf(buffer, sizeof(buffer), 
-             "BV%.2f CU%.2f SC%d SP%.1f SV%.1f SA%.1f "
-             "LC1S%d LC2S%d LC3S%d LC4S%d LC5S%d LC6S%d LC7S%d LC8S%d "
-             "MC1S%d MC2S%d "
-             "LC1B%d LC2B%d LC3B%d LC4B%d LC5B%d LC6B%d LC7B%d LC8B%d "
-             "LC1C%.2f LC2C%.2f LC3C%.2f LC4C%.2f LC5C%.2f LC6C%.2f LC7C%.2f LC8C%.2f "
-             "MC1C%.2f MC2C%.2f",
-             voltage, current, solarCharging,
-             solarPower, solarVoltage, solarCurrent,
-             lowCurrentStates[0], lowCurrentStates[1], lowCurrentStates[2], lowCurrentStates[3],
-             lowCurrentStates[4], lowCurrentStates[5], lowCurrentStates[6], lowCurrentStates[7],
-             mediumCurrentStates[0], mediumCurrentStates[1],
-             lowCurrentBrightness[0], lowCurrentBrightness[1], lowCurrentBrightness[2], lowCurrentBrightness[3],
-             lowCurrentBrightness[4], lowCurrentBrightness[5], lowCurrentBrightness[6], lowCurrentBrightness[7],
-             lowCurrents[0], lowCurrents[1], lowCurrents[2], lowCurrents[3],
-             lowCurrents[4], lowCurrents[5], lowCurrents[6], lowCurrents[7],
-             mediumCurrents[0], mediumCurrents[1]);
-    pCharacteristic->setValue(buffer);
+    String currentUsageHex = floatToHex(totatlCurrent, 100); // Current usage scaled by 100
+    // Build Voltage & Current section
+    String voltageCurrentSection = "V:" + batteryVoltageHex + "," + currentUsageHex + "," + solarVoltageHex + "," + solarCurrentHex + "," + solarPowerHex + ";";
+    
+    // Combine all sections
+    String dataPacket = voltageCurrentSection + loadChannelsSection + mediumChannelsSection;
+    totatlCurrent = 0;
+    // Send the data
+    pCharacteristic->setValue(dataPacket.c_str());
     pCharacteristic->notify();
+
+    Serial.println("Data sent: " + dataPacket); // Debug print
 }
 
-// Function to read quad current from high side drivers
+// Function to read quad current from high side drivers with rolling average
 float readQuadCurrent(int channel, int selectPin, int sensePin) {
     mcp.digitalWrite(selectPin, channel & 0x01);
     mcp.digitalWrite(selectPin + 1, (channel >> 1) & 0x01);
     delay(10);
     int adcValue = analogRead(sensePin);
     float voltage = adcValue * (3.3 / 4095.0) * 1000;
-    return (voltage / 1000.0) * 5050;
+    float current = (voltage / 1000.0) * 5050;
+    if(selectPin == Q2_SEL0) {
+      channel += 4;
+    }
+    // Serial.print(channel);
+    // Serial.print(" raw: ");
+    // Serial.println(current);
+    // Update the rolling buffer for this channel
+    lowCurrentBuffers[channel][lowCurrentIndex[channel]] = current;
+    lowCurrentIndex[channel] = (lowCurrentIndex[channel] + 1) % currentBufferSize;
+
+    // Calculate the rolling average
+    float sum = 0.0;
+    for (int i = 0; i < currentBufferSize; i++) {
+        sum += lowCurrentBuffers[channel][i];
+    }
+    // Serial.print(channel);
+    // Serial.print(" average: ");
+    // Serial.println(sum/currentBufferSize);
+    float avCurrent = sum / currentBufferSize;
+    totatlCurrent += avCurrent;
+    return avCurrent;
 }
 
-// Function to read dual current from high side drivers
+// Function to read dual current from high side drivers with rolling average
 float readDualCurrent(int channel) {
     mcp.digitalWrite(D_SEL, channel & 0x01);
     delay(10);
     int adcValue = analogRead(D_CS);
     float voltage = adcValue * (3.3 / 4095.0) * 1000;
-    return (voltage / 1000.0) * 9150;
+    float current = (voltage / 1000.0) * 9150;
+
+    // Update the rolling buffer for this medium channel
+    mediumCurrentBuffers[channel][mediumCurrentIndex[channel]] = current;
+    mediumCurrentIndex[channel] = (mediumCurrentIndex[channel] + 1) % currentBufferSize;
+
+    // Calculate the rolling average
+    float sum = 0.0;
+    for (int i = 0; i < currentBufferSize; i++) {
+        sum += mediumCurrentBuffers[channel][i];
+    }
+    float avCurrent = sum / currentBufferSize;
+    totatlCurrent += avCurrent;
+    return avCurrent;
 }
+
 
 // Function to disable all outputs due to low battery
 void disableOutputs() {
@@ -297,7 +283,7 @@ void disableOutputs() {
         digitalWrite(getMediumCurrentPin(i), LOW);
     }
     outputsDisabled = true;
-    flashLED('Y', 3, 300);
+    flashLED('R', 3, 300);
 }
 
 // Function to check battery voltage and trigger warnings
@@ -308,14 +294,13 @@ void checkBatteryVoltage() {
         batteryVoltage = readRealVoltage();
     }
 
-    if (batteryVoltage < 11.8) {
-        pulseLED('R', 1000);
+    if (batteryVoltage < critVoltage) {
         handleAutoShutdownWarning();
-    } else if (batteryVoltage < 12.0) {
-        flashLED('R', 3, 500);
-    } else if (batteryVoltage < 12.2 && !outputsDisabled) {
+    } else if (batteryVoltage < cutOutVoltage+0.2) {
+        flashLED('Y', 3, 500);
+    } else if (batteryVoltage < cutOutVoltage && !outputsDisabled) {
         disableOutputs();
-    } else if (batteryVoltage >= 12.2 && outputsDisabled) {
+    } else if (batteryVoltage >= cutInVoltage && outputsDisabled) {
         outputsDisabled = false;
         setLEDColor('G');
     }
@@ -455,7 +440,86 @@ void applyConfiguration(const std::string &config) {
             alwaysOnChannels[i] = aoString[i] == '1';
         }
     }
+    
+    pos = config.find("PR");
+    if (pos != std::string::npos) {
+        pos += 2;
+        next_pos = config.find(" ", pos);
+        std::string prString = config.substr(pos, next_pos - pos);
+        for (int i = 0; i < 10; ++i) {
+            priorityChannels[i] = prString[i] == '1';
+        }
+        Serial.print("Priority Channels: ");
+        for (int i = 0; i < 10; ++i) {
+            Serial.print(priorityChannels[i]);
+        }
+        Serial.println();
+    }
 }
+
+// BLE Server Callback for connection events
+class MyCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+        handleConnectionIndicator(); // New device connected
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+        // Start advertising again
+        BLEDevice::startAdvertising();
+        flashLED('R', 1, 250); // Device disconnected
+    }
+};
+
+// BLE Characteristic Callback for handling data received from the app
+class CharacteristicCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string value = std::string(pCharacteristic->getValue().c_str());
+        if (value.length() > 0) {
+            Serial.print("Received command: ");
+            Serial.println(value.c_str());
+            handleCommandReceivedIndicator(); // Command received
+
+            char command = value[0];
+            switch (command) {
+                case 'L': { // Control low current channels
+                    int lcIndex = value[1] - '1';
+                    lowCurrentStates[lcIndex] = (value[2] == '1');
+                    digitalWrite(getLowCurrentPin(lcIndex + 1), lowCurrentStates[lcIndex] ? HIGH : LOW);
+                    break;
+                }
+                case 'M': { // Control medium current channels
+                    int mcIndex = value[1] - '1';
+                    mediumCurrentStates[mcIndex] = (value[2] == '1');
+                    digitalWrite(getMediumCurrentPin(mcIndex + 1), mediumCurrentStates[mcIndex] ? HIGH : LOW);
+                    break;
+                }
+                case 'B': { // Set brightness for low current outputs
+                    int lcIndex = value[1] - '1';
+                    lowCurrentBrightness[lcIndex] = std::stoi(value.substr(2));
+                    if (lowCurrentStates[lcIndex]) {
+                        analogWrite(getLowCurrentPin(lcIndex + 1), lowCurrentBrightness[lcIndex]);
+                    }
+                    break;
+                }
+                case 'E': { // Error indicator command
+                    int code = std::stoi(value.substr(1));
+                    handleErrorIndicator(code);
+                    break;
+                }
+                case 'C': { // Configuration command
+                    applyConfiguration(value);
+                    break;
+                }
+                default:
+                    handleErrorIndicator(1); // Unknown command error
+                    break;
+            }
+        }
+    }
+};
+
 
 void setup() {
     Serial.begin(115200);
@@ -491,7 +555,8 @@ void setup() {
     pinMode(MC2, OUTPUT);
 
     pinMode(V_SENSE, INPUT); // Setup the voltage sense pin as input
-
+    mcp.digitalWrite(Q1_SEn, HIGH);
+    mcp.digitalWrite(Q2_SEn, HIGH);
     BLEDevice::init("ESP32_ACM");
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyCallbacks());
@@ -516,6 +581,17 @@ void setup() {
     // Initialize the voltage buffer
     for (int i = 0; i < voltageBufferSize; i++) {
         voltageBuffer[i] = 0.0;
+    }
+
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < currentBufferSize; j++) {
+            lowCurrentBuffers[i][j] = 0.0;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < currentBufferSize; j++) {
+            mediumCurrentBuffers[i][j] = 0.0;
+        }
     }
 
     xTaskCreate(
