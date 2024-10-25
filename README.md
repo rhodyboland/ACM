@@ -20,7 +20,7 @@ The device is to be app controlled from a mobile phone.
   - High current 12V input
   - CAN for expansion
 
-<img src="/Hardware/Images/IMG_4668.jpg" width=50% height=50%>
+<img src="/Hardware/Images/IMG_5168.jpg" width=50% height=50%>
 
 ### Software:
 #### Platform IO using arduino framework
