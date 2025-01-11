@@ -1,3 +1,7 @@
+//
+// ACMV2.ino
+// ESP32-S3
+
 #include <Wire.h>
 #include <Adafruit_MCP23X17.h>
 #include <SPI.h>
@@ -77,8 +81,8 @@ bool oldDeviceConnected = false;
 
 // Configuration and Status Variables
 float critVoltage = 10.0;
-float cutOutVoltage = 11.8;
-float cutInVoltage = 12.2;
+float cutOutVoltage = 11.0;
+float cutInVoltage = 11.5;
 bool autoCutoffEnabled = true;
 bool alwaysOnChannels[10] = {false, false, false, false, false, false, false, false, false, false};
 bool priorityChannels[10] = {false, false, false, false, false, false, false, false, false, false}; // Priority channels
@@ -88,10 +92,10 @@ int lowCurrentBrightness[8] = {255, 255, 255, 255, 255, 255, 255, 255};
 
 // Voltage divider ratio and calibration factor for voltage sensing
 const float voltageDividerRatio = 5.68;
-const float voltageCalibrationFactor = 1.00;
+const float voltageCalibrationFactor = 1.021;
 
 // Rolling average buffer for voltage readings
-const int voltageBufferSize = 10;
+const int voltageBufferSize = 20;
 float voltageBuffer[voltageBufferSize] = {0.0};
 int voltageBufferIndex = 0;
 unsigned long lastVoltageReadMillis = 0; // Last voltage read timestamp
@@ -108,9 +112,54 @@ int mediumCurrentIndex[2] = {0};
 
 bool errorPresent = false;
 int errorCode = 0;
-bool outputsDisabled = false;
-float batteryVoltage = 0; // Initial battery voltage
+float batteryVoltage = 12; // Initial battery voltage
 float totatlCurrent = 0;
+
+// Maximum block size to prevent buffer overflow
+#define MAX_BLOCK_SIZE 512
+
+// Buffer to store incoming block data
+char blockBuffer[MAX_BLOCK_SIZE];
+int blockIndex = 0;
+
+// Watchdog variables
+unsigned long lastSerialDataMillis = 0; // Timestamp of last received serial data
+const unsigned long WATCHDOG_TIMEOUT = 3000; // 10 seconds in milliseconds
+bool serialConnectionActive = false; // Flag indicating if serial data is being received
+
+
+// Variables to store victron field values
+unsigned int PID; // Product ID
+unsigned int FW; // Firmware version
+String SER_num; // Serial number
+int V; // main battery voltage
+int I; // main battery current
+int VPV; // panel voltage (mV)
+int PPV; // Panel Power (W)
+int CS; // Current state (of operation)
+unsigned long OR; // Off reason
+int ERR; // Error code
+String LOAD_state; // Load state (ON/OFF)
+int IL; // Load Current (mA)
+int H19; // Yield total (0.01kWh)
+int H20; // Yield today (0.01kWh)
+int H21; // Max power today (W)
+int H22; // Yield Yesterday (0.01kWh)
+int H23; //Max power yesterday (W)
+int HSDS; // Day sequence number (0-364)
+
+// Enum to manage reading states
+enum State { 
+  READING_LINES,      // Currently reading lines within a block
+  BLOCK_COMPLETE      // Block reading complete and ready for processing
+};
+State currentState = READING_LINES;
+
+// Temporary storage for the current line being read
+String currentLine = "";
+
+// Variable to accumulate checksum
+uint32_t checksumSum = 0;
 
 // ----- Function Prototypes -----
 void setLEDColor(char color);
@@ -178,14 +227,22 @@ String floatToHex(float value, int scale) {
 String stateToHex(bool state) {
     return state ? "1" : "0";
 }
+float readInverterVoltage() {
+    // Example: If INV_STATE is an analog-capable pin
+    // Adjust the ADC range, voltage reference, and scaling as needed
+    int rawValue = analogRead(INV_STATE);
+    float measuredVoltage = (rawValue * 3.3f / 4095.0f); // For ESP32 12-bit ADC
+    return measuredVoltage;
+}
 
 // Function to send sensor data over BLE
 void sendSensorData() {
     // Voltage and Current (Hex representation)
     String batteryVoltageHex = floatToHex(batteryVoltage, 100); // Voltage scaled by 100 (e.g., 12.34 -> 0C4A)
-    String solarVoltageHex = floatToHex(24.0, 100);
-    String solarCurrentHex = floatToHex(4.0, 100);
-    String solarPowerHex = floatToHex(100.0, 100);    
+    String solarVoltageHex = floatToHex(VPV, 100);
+    String solarCurrentHex = floatToHex(PPV/(VPV+0.0001), 100);
+    String solarPowerHex = floatToHex(PPV, 100);
+    String solarStateHex = floatToHex(CS, 1);
 
     // Load Channels (Low current)
     String loadChannelsSection = "L:";
@@ -207,11 +264,22 @@ void sendSensorData() {
     }
 
     String currentUsageHex = floatToHex(totatlCurrent, 100); // Current usage scaled by 100
+
+    // Connection state flag
+    String connectionFlag = serialConnectionActive ? "1" : "0"; // 1 for active, 0 for inactive
+
     // Build Voltage & Current section
-    String voltageCurrentSection = "V:" + batteryVoltageHex + "," + currentUsageHex + "," + solarVoltageHex + "," + solarCurrentHex + "," + solarPowerHex + ";";
+    String voltageCurrentSection = "V:" + batteryVoltageHex + "," + currentUsageHex + "," + solarVoltageHex + "," + solarCurrentHex + "," + solarPowerHex + "," + solarStateHex + "," + connectionFlag + ";";
     
+    float inverterVoltage = readInverterVoltage();
+    // Convert to a hex string (scaled by 100, for example)
+    String inverterHex = floatToHex(inverterVoltage, 100);
+
+    // Add an inverter section to the data packet, e.g. "I:0FA6;"
+    // (whatever formatting you prefer)
+    String inverterSection = "I:" + inverterHex + ";";
     // Combine all sections
-    String dataPacket = voltageCurrentSection + loadChannelsSection + mediumChannelsSection;
+    String dataPacket = voltageCurrentSection + loadChannelsSection + mediumChannelsSection + inverterSection;
     totatlCurrent = 0;
     // Send the data
     pCharacteristic->setValue(dataPacket.c_str());
@@ -282,29 +350,127 @@ void disableOutputs() {
     for (int i = 1; i <= 2; i++) {
         digitalWrite(getMediumCurrentPin(i), LOW);
     }
-    outputsDisabled = true;
     flashLED('R', 3, 300);
 }
+
+/**
+ * @brief Update the channel outputs based on:
+ *        - Always-On flags
+ *        - Priority flags
+ *        - Low battery conditions
+ *        - User states (lowCurrentStates, mediumCurrentStates)
+ */
+void updateChannels() {
+    // Decide logic thresholds:
+    bool batteryIsCritical = (batteryVoltage < critVoltage);
+    bool batteryIsLow      = (batteryVoltage < cutOutVoltage);
+
+    // ----- LOW CURRENT CHANNELS (8 channels) -----
+    for (int i = 0; i < 8; i++) {
+        // Always-On channel or Priority channel?
+        bool ao  = alwaysOnChannels[i];     // always on
+        bool pri = priorityChannels[i];     // priority
+
+        // If battery is critically low, turn everything off
+        if (batteryIsCritical) {
+            lowCurrentStates[i] = false;
+            digitalWrite(getLowCurrentPin(i + 1), LOW);
+        }
+        // If battery is below normal cut-out but above critical:
+        // - Keep Priority or Always-On channels ON
+        else if (batteryIsLow) {
+            if (ao || pri) {
+                // Force ON
+                lowCurrentStates[i] = true;
+                digitalWrite(getLowCurrentPin(i + 1), HIGH);
+            } else {
+                // Force OFF for non-priority
+                lowCurrentStates[i] = false;
+                digitalWrite(getLowCurrentPin(i + 1), LOW);
+            }
+        }
+        // Otherwise, battery is above cut-out => normal operation
+        else {
+            if (ao) {
+                // Force ON if Always-On
+                lowCurrentStates[i] = true;
+                digitalWrite(getLowCurrentPin(i + 1), HIGH);
+            } else {
+                // Use whatever the user/app last commanded
+                digitalWrite(getLowCurrentPin(i + 1), lowCurrentStates[i] ? HIGH : LOW);
+            }
+        }
+    }
+
+    // ----- MEDIUM CURRENT CHANNELS (2 channels) -----
+    for (int i = 0; i < 2; i++) {
+        // For medium channels, decide how you want alwaysOn/priority to behave.
+        // If you have alwaysOn/priority settings for them, use the same approach.
+        // For demonstration, let's assume the first 2 bits of each array apply to medium channels 0 and 1:
+        bool ao  = alwaysOnChannels[8 + i];      // Channels 9 and 10 in your array
+        bool pri = priorityChannels[8 + i];      // Channels 9 and 10 in your array
+
+        if (batteryIsCritical) {
+            mediumCurrentStates[i] = false;
+            digitalWrite(getMediumCurrentPin(i + 1), LOW);
+        }
+        else if (batteryIsLow) {
+            if (ao || pri) {
+                mediumCurrentStates[i] = true;
+                digitalWrite(getMediumCurrentPin(i + 1), HIGH);
+            } else {
+                mediumCurrentStates[i] = false;
+                digitalWrite(getMediumCurrentPin(i + 1), LOW);
+            }
+        }
+        else {
+            if (ao) {
+                mediumCurrentStates[i] = true;
+                digitalWrite(getMediumCurrentPin(i + 1), HIGH);
+            } else {
+                digitalWrite(getMediumCurrentPin(i + 1), mediumCurrentStates[i] ? HIGH : LOW);
+            }
+        }
+    }
+}
+
 
 // Function to check battery voltage and trigger warnings
 void checkBatteryVoltage() {
     unsigned long currentMillis = millis();
-    if (currentMillis - lastVoltageReadMillis >= 100) { // Check if 100 ms have passed
+    // For example, sample voltage every 100 ms
+    if (currentMillis - lastVoltageReadMillis >= 100) {
         lastVoltageReadMillis = currentMillis;
-        batteryVoltage = readRealVoltage();
+
+        // 1) Read the raw voltage
+        float latestReading = readRealVoltage();
+
+        // 2) Store into the rolling buffer
+        voltageBuffer[voltageBufferIndex] = latestReading;
+        voltageBufferIndex++;
+        if (voltageBufferIndex >= voltageBufferSize) {
+            voltageBufferIndex = 0;  // wrap around
+        }
+
+        // 3) Compute the average of the buffer
+        float sum = 0;
+        for (int i = 0; i < voltageBufferSize; i++) {
+            sum += voltageBuffer[i];
+        }
+        batteryVoltage = sum / voltageBufferSize;
     }
 
+    // Instead, just do your warnings if you like:
     if (batteryVoltage < critVoltage) {
-        handleAutoShutdownWarning();
-    } else if (batteryVoltage < cutOutVoltage+0.2) {
-        flashLED('Y', 3, 500);
-    } else if (batteryVoltage < cutOutVoltage && !outputsDisabled) {
-        disableOutputs();
-    } else if (batteryVoltage >= cutInVoltage && outputsDisabled) {
-        outputsDisabled = false;
-        setLEDColor('G');
+        handleAutoShutdownWarning();  // Maybe pulse LED in red, etc.
+    } else if (batteryVoltage < (cutOutVoltage + 0.2)) {
+        flashLED('Y', 3, 500);  // Example early warning
     }
+
+    // Now enforce Always-On & Priority channels here:
+    updateChannels();
 }
+
 
 // Function to indicate new connection
 void handleConnectionIndicator() {
@@ -439,6 +605,11 @@ void applyConfiguration(const std::string &config) {
         for (int i = 0; i < 10; ++i) {
             alwaysOnChannels[i] = aoString[i] == '1';
         }
+        Serial.print("Always on Channels: ");
+        for (int i = 0; i < 10; ++i) {
+            Serial.print(alwaysOnChannels[i]);
+        }
+        Serial.println();
     }
     
     pos = config.find("PR");
@@ -512,6 +683,24 @@ class CharacteristicCallbacks : public BLECharacteristicCallbacks {
                     applyConfiguration(value);
                     break;
                 }
+                case 'I': {
+                    // Example command: "I1X" => 'I' + "1" for inverter #1 + "1" or "0" for ON/OFF
+                    // If you only have one inverter channel, you can ignore the second char or just assume index = 1
+                    int invIndex = value[1] - '1'; 
+                    bool turnOn  = (value[2] == '1');
+
+                    // For an inverter that toggles on momentary press, we do a short pulse on INV_CTRL:
+                    Serial.print("Inverter command received: ");
+                    Serial.println(turnOn ? "ON" : "OFF");
+
+                    // Pulse the control pin—just do the same action for ON or OFF if the inverter toggles.
+                    // Adjust timing if your inverter needs a shorter or longer pulse.
+                    mcp.digitalWrite(INV_CTRL, HIGH);
+                    delay(250);          // 250ms press
+                    mcp.digitalWrite(INV_CTRL, LOW);
+
+                    break;
+                }
                 default:
                     handleErrorIndicator(1); // Unknown command error
                     break;
@@ -520,10 +709,109 @@ class CharacteristicCallbacks : public BLECharacteristicCallbacks {
     }
 };
 
+// Function to parse the complete block of data
+void parseVictronBlock(char* buffer) {
+  // Create a copy of the buffer to use with strtok
+  char tempBuffer[MAX_BLOCK_SIZE];
+  strncpy(tempBuffer, buffer, MAX_BLOCK_SIZE);
+  tempBuffer[MAX_BLOCK_SIZE - 1] = '\0'; // Ensure null termination
 
+  // Initialize or reset all field variables
+  PID = 0;
+  FW = 0;
+  SER_num = "";
+  V = 0;
+  I = 0;
+  VPV = 0;
+  PPV = 0;
+  CS = 0;
+  OR = 0;
+  ERR = 0;
+  LOAD_state = "";
+  IL = 0;
+  H19 = 0;
+  H20 = 0;
+  H21 = 0;
+  H22 = 0;
+  H23 = 0;
+  HSDS = 0;
+
+  // Tokenize the buffer into individual lines separated by \r\n
+  char* line = strtok(tempBuffer, "\r\n");
+  while (line != NULL) {
+    // Split each line into label and value based on the tab character
+    char* tabPos = strchr(line, '\t');
+    if (tabPos != NULL) {
+      *tabPos = '\0'; // Null-terminate the label
+      char* label = line;
+      char* value = tabPos + 1;
+
+      // Parse and assign values based on the label
+      if (strcmp(label, "PID") == 0) {
+        PID = strtol(value, NULL, 16); // PID is in hexadecimal
+      }
+      else if (strcmp(label, "FW") == 0) {
+        FW = atoi(value);
+      }
+      else if (strcmp(label, "SER#") == 0) {
+        SER_num = String(value);
+      }
+      else if (strcmp(label, "V") == 0) {
+        V = atoi(value);
+      }
+      else if (strcmp(label, "I") == 0) {
+        I = atoi(value);
+      }
+      else if (strcmp(label, "VPV") == 0) {
+        VPV = atoi(value);
+      }
+      else if (strcmp(label, "PPV") == 0) {
+        PPV = atoi(value);
+      }
+      else if (strcmp(label, "CS") == 0) {
+        CS = atoi(value);
+      }
+      else if (strcmp(label, "OR") == 0) {
+        OR = strtoul(value, NULL, 16); // OR is in hexadecimal
+      }
+      else if (strcmp(label, "ERR") == 0) {
+        ERR = atoi(value);
+      }
+      else if (strcmp(label, "LOAD") == 0) {
+        LOAD_state = String(value);
+      }
+      else if (strcmp(label, "IL") == 0) {
+        IL = atoi(value);
+      }
+      else if (strcmp(label, "H19") == 0) {
+        H19 = atoi(value);
+      }
+      else if (strcmp(label, "H20") == 0) {
+        H20 = atoi(value);
+      }
+      else if (strcmp(label, "H21") == 0) {
+        H21 = atoi(value);
+      }
+      else if (strcmp(label, "H22") == 0) {
+        H22 = atoi(value);
+      }
+      else if (strcmp(label, "H23") == 0) {
+        H23 = atoi(value);
+      }
+      else if (strcmp(label, "HSDS") == 0) {
+        HSDS = atoi(value);
+      }
+      // Add additional fields here as needed
+    }
+
+    // Proceed to the next line
+    line = strtok(NULL, "\r\n");
+  }
+}
 void setup() {
     Serial.begin(115200);
-
+    Serial1.begin(19200, SERIAL_8N1, 9, 8);
+    Serial.println("Serial1 initialized at 19200 baud");
     // Initialize MCP23S17 with SPI
     if (!mcp.begin_SPI(MCP_ChipSelect)) {
         Serial.println("Failed to initialize MCP23S17");
@@ -542,6 +830,7 @@ void setup() {
     mcp.pinMode(D_SEn, OUTPUT);
     mcp.pinMode(D_SEL, OUTPUT);
     mcp.pinMode(D_RST, OUTPUT);
+    mcp.pinMode(INV_CTRL, OUTPUT);
 
     pinMode(LC1, OUTPUT);
     pinMode(LC2, OUTPUT);
@@ -553,10 +842,17 @@ void setup() {
     pinMode(LC8, OUTPUT);
     pinMode(MC1, OUTPUT);
     pinMode(MC2, OUTPUT);
+    
+
+    
+    pinMode(INV_STATE, INPUT);
 
     pinMode(V_SENSE, INPUT); // Setup the voltage sense pin as input
+
+    mcp.digitalWrite(INV_CTRL, LOW); // ensure default LOW
     mcp.digitalWrite(Q1_SEn, HIGH);
     mcp.digitalWrite(Q2_SEn, HIGH);
+
     BLEDevice::init("ESP32_ACM");
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyCallbacks());
@@ -609,9 +905,81 @@ void setup() {
     );
 }
 
+
 void loop() {
     checkBatteryVoltage(); // Continuously monitor battery voltage
 
     // Check error state periodically
     manageErrorState();
+
+    // Read serial data
+    while (Serial1.available()) {
+        char incomingByte = Serial1.read();
+
+        // Add the byte to the checksum sum
+        checksumSum += static_cast<unsigned char>(incomingByte);
+
+        // Append the byte to the block buffer if there's space
+        if (blockIndex < MAX_BLOCK_SIZE - 1) { // Reserve space for null terminator
+            blockBuffer[blockIndex++] = incomingByte;
+            // Update the last received timestamp
+            lastSerialDataMillis = millis();
+            serialConnectionActive = true;
+        }
+        else {
+            // Buffer overflow protection
+            Serial.println("Error: Block buffer overflow");
+            // Reset buffer and checksum
+            blockIndex = 0;
+            checksumSum = 0;
+            currentLine = "";
+            return; // Exit the loop to prevent further processing
+        }
+
+        // Check for end-of-line character to process the current line
+        if (incomingByte == '\n') {
+            // Remove carriage return if present
+            if (currentLine.endsWith("\r")) {
+                currentLine.remove(currentLine.length() - 1);
+            }
+
+            // Check if the current line is the "Checksum" field
+            if (currentLine.startsWith("Checksum\t")) {
+                // Verify the checksum
+                if ((checksumSum % 256) == 0) {
+                    // Null-terminate the block buffer for safe string operations
+                    blockBuffer[blockIndex] = '\0';
+
+                    // Parse the complete block
+                    parseVictronBlock(blockBuffer);
+                }
+                else {
+                    Serial.println("Error: Checksum invalid");
+                }
+
+                // Reset for the next block
+                blockIndex = 0;
+                checksumSum = 0;
+            }
+            else {
+                // For non-Checksum lines, continue accumulating
+            }
+
+            // Reset the current line for the next incoming line
+            currentLine = "";
+        }
+        else {
+            // Accumulate characters to form the current line
+            currentLine += incomingByte;
+        }
+    }
+
+    // Implement watchdog outside the serial reading loop
+    if (millis() - lastSerialDataMillis > WATCHDOG_TIMEOUT) {
+        if (serialConnectionActive) {
+            serialConnectionActive = false;
+            Serial.println("Watchdog: No serial data received for 3 seconds.");
+            // Optionally, perform actions like disabling outputs or notifying via BLE
+        }
+    }
 }
