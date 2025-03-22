@@ -80,8 +80,8 @@ bool oldDeviceConnected = false;
 
 // Configuration and Status Variables
 float critVoltage = 10.0;
-float cutOutVoltage = 11.8;
-float cutInVoltage = 12.2;
+float cutOutVoltage = 11.0;
+float cutInVoltage = 11.5;
 bool autoCutoffEnabled = true;
 bool alwaysOnChannels[10] = {false, false, false, false, false, false, false, false, false, false};
 bool priorityChannels[10] = {false, false, false, false, false, false, false, false, false, false}; // Priority channels
@@ -91,7 +91,7 @@ int lowCurrentBrightness[8] = {255, 255, 255, 255, 255, 255, 255, 255};
 
 // Voltage divider ratio and calibration factor for voltage sensing
 const float voltageDividerRatio = 5.68;
-const float voltageCalibrationFactor = 1.00;
+const float voltageCalibrationFactor = 1.021;
 
 // Rolling average buffer for voltage readings
 const int voltageBufferSize = 10;
@@ -308,6 +308,14 @@ bool parseBmsFrame(const uint8_t *buf, uint16_t len) {
   return false;
 }
 
+float readInverterVoltage() {
+    // Example: If INV_STATE is an analog-capable pin
+    // Adjust the ADC range, voltage reference, and scaling as needed
+    int rawValue = analogRead(INV_STATE);
+    float measuredVoltage = (rawValue * 3.3f / 4095.0f); // For ESP32 12-bit ADC
+    return measuredVoltage;
+}
+
 // Poll the JK-BMS, read & parse data
 void pollBms() {
   // 1) Clear leftover
@@ -327,6 +335,8 @@ void pollBms() {
     lastBmsDataMillis = millis();
   }
 }
+
+
 
 // ----------------------------------------------------------------------
 // Function Prototypes from Original Code
@@ -403,6 +413,25 @@ class CharacteristicCallbacks : public BLECharacteristicCallbacks {
                     applyConfiguration(value);
                     break;
                 }
+
+                case 'I': {
+
+                    // Example command: "I1X" => 'I' + "1" for inverter #1 + "1" or "0" for ON/OFF
+                    // If you only have one inverter channel, you can ignore the second char or just assume index = 1
+                    int invIndex = value[1] - '1'; 
+                    bool turnOn  = (value[2] == '1');
+                    // For an inverter that toggles on momentary press, we do a short pulse on INV_CTRL:
+                    Serial.print("Inverter command received: ");
+                    Serial.println(turnOn ? "ON" : "OFF");
+
+                    // Pulse the control pin—just do the same action for ON or OFF if the inverter toggles.
+                    // Adjust timing if your inverter needs a shorter or longer pulse.
+                    mcp.digitalWrite(INV_CTRL, HIGH);
+                    delay(250);          // 250ms press
+                    mcp.digitalWrite(INV_CTRL, LOW);
+                    break;
+
+                }
                 default:
                     handleErrorIndicator(1); 
                     break;
@@ -410,6 +439,88 @@ class CharacteristicCallbacks : public BLECharacteristicCallbacks {
         }
     }
 };
+
+
+/**
+ * @brief Update the channel outputs based on:
+ *        - Always-On flags
+ *        - Priority flags
+ *        - Low battery conditions
+ *        - User states (lowCurrentStates, mediumCurrentStates)
+ */
+void updateChannels() {
+    // Decide logic thresholds:
+    bool batteryIsCritical = (batteryVoltage < critVoltage);
+    bool batteryIsLow      = (batteryVoltage < cutOutVoltage);
+
+    // ----- LOW CURRENT CHANNELS (8 channels) -----
+    for (int i = 0; i < 8; i++) {
+        // Always-On channel or Priority channel?
+        bool ao  = alwaysOnChannels[i];     // always on
+        bool pri = priorityChannels[i];     // priority
+
+        // If battery is critically low, turn everything off
+        if (batteryIsCritical) {
+            lowCurrentStates[i] = false;
+            digitalWrite(getLowCurrentPin(i + 1), LOW);
+        }
+        // If battery is below normal cut-out but above critical:
+        // - Keep Priority or Always-On channels ON
+        else if (batteryIsLow) {
+            if (ao || pri) {
+                // Force ON
+                lowCurrentStates[i] = true;
+                digitalWrite(getLowCurrentPin(i + 1), HIGH);
+            } else {
+                // Force OFF for non-priority
+                lowCurrentStates[i] = false;
+                digitalWrite(getLowCurrentPin(i + 1), LOW);
+            }
+        }
+        // Otherwise, battery is above cut-out => normal operation
+        else {
+            if (ao) {
+                // Force ON if Always-On
+                lowCurrentStates[i] = true;
+                digitalWrite(getLowCurrentPin(i + 1), HIGH);
+            } else {
+                // Use whatever the user/app last commanded
+                digitalWrite(getLowCurrentPin(i + 1), lowCurrentStates[i] ? HIGH : LOW);
+            }
+        }
+    }
+
+    // ----- MEDIUM CURRENT CHANNELS (2 channels) -----
+    for (int i = 0; i < 2; i++) {
+        // For medium channels, decide how you want alwaysOn/priority to behave.
+        // If you have alwaysOn/priority settings for them, use the same approach.
+        // For demonstration, let's assume the first 2 bits of each array apply to medium channels 0 and 1:
+        bool ao  = alwaysOnChannels[8 + i];      // Channels 9 and 10 in your array
+        bool pri = priorityChannels[8 + i];      // Channels 9 and 10 in your array
+
+        if (batteryIsCritical) {
+            mediumCurrentStates[i] = false;
+            digitalWrite(getMediumCurrentPin(i + 1), LOW);
+        }
+        else if (batteryIsLow) {
+            if (ao || pri) {
+                mediumCurrentStates[i] = true;
+                digitalWrite(getMediumCurrentPin(i + 1), HIGH);
+            } else {
+                mediumCurrentStates[i] = false;
+                digitalWrite(getMediumCurrentPin(i + 1), LOW);
+            }
+        }
+        else {
+            if (ao) {
+                mediumCurrentStates[i] = true;
+                digitalWrite(getMediumCurrentPin(i + 1), HIGH);
+            } else {
+                digitalWrite(getMediumCurrentPin(i + 1), mediumCurrentStates[i] ? HIGH : LOW);
+            }
+        }
+    }
+}
 
 void getSensor() {
   
@@ -547,6 +658,7 @@ void setup() {
     mcp.pinMode(D_SEn, OUTPUT);
     mcp.pinMode(D_SEL, OUTPUT);
     mcp.pinMode(D_RST, OUTPUT);
+    mcp.pinMode(INV_CTRL, OUTPUT);
 
     pinMode(LC1, OUTPUT);
     pinMode(LC2, OUTPUT);
@@ -562,6 +674,8 @@ void setup() {
     pinMode(V_SENSE, INPUT); 
     mcp.digitalWrite(Q1_SEn, HIGH);
     mcp.digitalWrite(Q2_SEn, HIGH);
+    mcp.digitalWrite(INV_CTRL, LOW); // ensure default LOW
+    pinMode(INV_STATE, INPUT);
 
     // BLE init
     BLEDevice::init("ESP32_ACM");
@@ -709,6 +823,8 @@ void checkBatteryVoltage() {
         outputsDisabled = false;
         setLEDColor('G');
     }
+    // Now enforce Always-On & Priority channels here:
+    updateChannels();
 }
 
 // ----------------------------------------------------------------------
@@ -724,12 +840,14 @@ void sendSensorData() {
     // In your original code, you assemble voltageCurrentSection with:
     //   batteryVoltage (from the global), totalCurrent, solarVoltage, solarCurrent, ...
     // We'll add the BMS connect flag similarly to how we do "connectionFlag" for victron.
-
+    float inverterVoltage = readInverterVoltage();
     // Voltage & Current:
     String batteryVoltageHex = floatToHex(batteryVoltage, 100);
     String cellAvgHex = floatToHex(avgCellVoltage, 100);
     // totalCurrent is from your readQuadCurrent & readDualCurrent sums
-    String currentUsageBMSHex = floatToHex(bmsCurrent, 100);
+    // bmsCurrent is A*10 ie -4 A -> 40.00
+    String currentUsageBMSHex = floatToHex(bmsCurrent, 10);
+    // Serial.println(bmsCurrent);
     String currentUsageHex = floatToHex(totalCurrent, 100);
     // Solar from your code:
     String solarVoltageHex = floatToHex(VPV, 100);
@@ -742,6 +860,9 @@ void sendSensorData() {
     String batSocHex = floatToHex(bmsSoc, 100);
     // Serial.println(sensor1);
     String sensor1Hex = floatToHex(sensor1, 100);
+
+    // Convert to a hex string (scaled by 100, for example)
+    String inverterHex = floatToHex(inverterVoltage, 100);
 
     // Victron connection flag:
     String connectionFlag = serialConnectionActive ? "1" : "0";
@@ -776,8 +897,14 @@ void sendSensorData() {
         mediumChannelsSection += stateHex + currentHex + ((i < 1) ? "," : ";");
     }
 
-    // Build final string
-    String dataPacket = voltageCurrentSection + loadChannelsSection + mediumChannelsSection;
+    
+    // Add an inverter section to the data packet, e.g. "I:0FA6;"
+    // (whatever formatting you prefer)
+    String inverterSection = "I:" + inverterHex + ";";
+
+
+    // Combine all sections
+    String dataPacket = voltageCurrentSection + loadChannelsSection + mediumChannelsSection + inverterSection;
     totalCurrent = 0; // Reset after each send
 
     pCharacteristic->setValue(dataPacket.c_str());
