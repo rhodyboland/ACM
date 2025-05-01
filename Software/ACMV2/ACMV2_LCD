@@ -1,0 +1,871 @@
+/**
+ * ACMV2_LCD_REALTIME.ino
+ *
+ * Demonstrates:
+ *   - A main screen with Battery / Solar / Sensor "cards"
+ *   - Bigger detail popups in the center
+ *   - Battery detail has a large arc + data cards
+ *   - Real-time updates using global variables and a refresh function
+ */
+
+#include <Arduino.h>
+#include <esp_display_panel.hpp>
+#include <lvgl.h>
+#include "lvgl_v8_port.h"
+
+// -----------------------------------------------------------------------------
+// Global Data Variables for Real-Time Updates
+// -----------------------------------------------------------------------------
+// You can write to these whenever your BLE data updates, then call updateAllUI().
+float g_batteryPercent  = 85.0f;    // 0..100
+float g_batteryVoltage  = 12.6f;
+float g_batteryCurrent  = -14.3f;
+float g_batteryTemp     = 30.5f;
+float g_batteryAvgCell  = 3.15f;
+
+float g_solarVoltage    = 24.2f;
+float g_solarCurrent    = 6.7f;
+float g_solarPower      = 220.0f;
+char  g_solarState[16]  = "Bulk";  // e.g. "Bulk", "Float", etc.
+
+float g_sensorTemp      = 24.6f;
+
+// -----------------------------------------------------------------------------
+// Main-Screen UI Refs (for real-time update of the "12.6V / 85%" etc. text)
+// -----------------------------------------------------------------------------
+static lv_obj_t* g_lblBatteryMain = nullptr;
+static lv_obj_t* g_lblSolarMain   = nullptr;
+static lv_obj_t* g_lblSensorMain  = nullptr;
+
+// -----------------------------------------------------------------------------
+// Battery Detail UI Refs
+// -----------------------------------------------------------------------------
+static lv_obj_t* g_batteryOverlay        = nullptr;  // The full-screen overlay
+static lv_obj_t* g_batteryDetailPanel    = nullptr;  // The battery detail popup
+static lv_obj_t* g_batteryArc            = nullptr;  
+static lv_obj_t* g_lblBattVoltage        = nullptr;
+static lv_obj_t* g_lblBattCurrent        = nullptr;
+static lv_obj_t* g_lblBattTemp           = nullptr;
+static lv_obj_t* g_lblBattAvgCell        = nullptr;
+static lv_obj_t* g_lblBattPercent        = nullptr;
+
+// -----------------------------------------------------------------------------
+// Solar Detail UI Refs
+// -----------------------------------------------------------------------------
+static lv_obj_t* g_solarOverlay       = nullptr;
+static lv_obj_t* g_solarDetailPanel   = nullptr;
+// We'll store label references for each field
+static lv_obj_t* g_lblSolarVoltage    = nullptr;
+static lv_obj_t* g_lblSolarCurrent    = nullptr;
+static lv_obj_t* g_lblSolarPower      = nullptr;
+static lv_obj_t* g_lblSolarState      = nullptr;
+
+// -----------------------------------------------------------------------------
+// Sensor Detail UI Refs
+// -----------------------------------------------------------------------------
+static lv_obj_t* g_sensorOverlay      = nullptr;
+static lv_obj_t* g_sensorDetailPanel  = nullptr;
+static lv_obj_t* g_lblSensorTemp      = nullptr;
+
+// -----------------------------------------------------------------------------
+// Forward Declarations
+// -----------------------------------------------------------------------------
+static void createMainUI();
+static lv_obj_t* createDataPanel(lv_obj_t *parent, const char *title, lv_obj_t **valueLabelRef, lv_event_cb_t event_cb);
+
+// Event callbacks for tapping data panels
+static void batteryDetail_event_cb(lv_event_t * e);
+static void solarDetail_event_cb(lv_event_t * e);
+static void sensorDetail_event_cb(lv_event_t * e);
+
+// Channel / Inverter toggles
+static void channelBtn_event_cb(lv_event_t * e);
+static void inverterBtn_event_cb(lv_event_t * e);
+static lv_obj_t* createChannelButton(lv_obj_t *parent, const char *labelText);
+static lv_obj_t* createInverterButton(lv_obj_t *parent);
+
+// Battery detail creation
+static void openBatteryDetailPopup();
+static void refreshBatteryDetailUI();  // updates text & arc angles
+
+// Solar detail creation
+static void openSolarDetailPopup();
+static void refreshSolarDetailUI();
+
+// Sensor detail creation
+static void openSensorDetailPopup();
+static void refreshSensorDetailUI();
+
+// Common UI helpers
+static lv_obj_t* createDetailDataCard(lv_obj_t * parent,
+                                      const char *title,
+                                      lv_obj_t **valueLabelRef);
+static void fadeInOverlay(lv_obj_t * overlay);
+
+// Battery arc helper
+static lv_obj_t* createBatteryArc(lv_obj_t* parent, int batteryValue);
+static void updateBatteryArc(lv_obj_t* arc, int batteryValue);
+
+// We'll also define an "updateAllUI" function
+static void updateAllUI();
+
+// -----------------------------------------------------------------------------
+// Basic LVGL Styles
+// -----------------------------------------------------------------------------
+static lv_style_t styleScreenBg;
+static lv_style_t stylePanel;
+static lv_style_t stylePanelTitle;
+static lv_style_t stylePanelValue;
+static lv_style_t styleBtnOff;
+static lv_style_t styleBtnOn;
+static lv_style_t styleBtnError;
+
+
+// -----------------------------------------------------------------------------
+// Setup & Loop
+// -----------------------------------------------------------------------------
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("ACMV2_LCD_REALTIME start");
+
+    // 1) Initialize panel device
+    ESP_Panel* panel = new ESP_Panel();
+    panel->init();
+    panel->begin();
+
+    // 2) Initialize LVGL
+    lvgl_port_init(panel->getLcd(), panel->getTouch());
+
+    // 3) Build UI
+    lvgl_port_lock(-1);
+    {
+        // --- Initialize styles ---
+        // Dark background with a subtle gradient
+        lv_style_init(&styleScreenBg);
+        lv_style_set_bg_color(&styleScreenBg, lv_color_hex(0x1B1C1E));
+        lv_style_set_bg_grad_color(&styleScreenBg, lv_color_hex(0x333333));
+        lv_style_set_bg_grad_dir(&styleScreenBg, LV_GRAD_DIR_VER);
+        lv_style_set_bg_opa(&styleScreenBg, LV_OPA_COVER);
+
+        // Panel style (for Battery/Solar/Sensors “cards”)
+        lv_style_init(&stylePanel);
+        lv_style_set_radius(&stylePanel, 12);
+        lv_style_set_bg_color(&stylePanel, lv_color_hex(0x3A506B));
+        lv_style_set_bg_grad_color(&stylePanel, lv_color_hex(0x5B728A));
+        lv_style_set_bg_grad_dir(&stylePanel, LV_GRAD_DIR_VER);
+        lv_style_set_bg_opa(&stylePanel, LV_OPA_COVER);
+        lv_style_set_pad_all(&stylePanel, 10);
+
+        // Panel title
+        lv_style_init(&stylePanelTitle);
+        lv_style_set_text_font(&stylePanelTitle, &lv_font_montserrat_20);
+
+        // Panel value
+        lv_style_init(&stylePanelValue);
+        lv_style_set_text_font(&stylePanelValue, &lv_font_montserrat_24);
+        lv_style_set_text_color(&stylePanelValue, lv_color_white());
+
+        // Button OFF
+        lv_style_init(&styleBtnOff);
+        lv_style_set_radius(&styleBtnOff, 10);
+        lv_style_set_bg_grad_dir(&styleBtnOff, LV_GRAD_DIR_VER);
+        lv_style_set_bg_color(&styleBtnOff, lv_color_hex(0x777777));
+        lv_style_set_bg_grad_color(&styleBtnOff, lv_color_hex(0xAAAAAA));
+
+        // Button ON
+        lv_style_init(&styleBtnOn);
+        lv_style_set_radius(&styleBtnOn, 10);
+        lv_style_set_bg_grad_dir(&styleBtnOn, LV_GRAD_DIR_VER);
+        lv_style_set_bg_color(&styleBtnOn, lv_palette_main(LV_PALETTE_GREEN));
+        lv_style_set_bg_grad_color(&styleBtnOn, lv_color_hex(0x98FB98));
+
+        // Error
+        lv_style_init(&styleBtnError);
+        lv_style_set_radius(&styleBtnError, 10);
+        lv_style_set_bg_grad_dir(&styleBtnError, LV_GRAD_DIR_VER);
+        lv_style_set_bg_color(&styleBtnError, lv_palette_main(LV_PALETTE_RED));
+        lv_style_set_bg_grad_color(&styleBtnError, lv_color_hex(0xFF8C00));
+
+        // Build main screen UI
+        createMainUI();
+
+        // Optionally rotate display 90 degrees
+        lv_disp_t *disp = lv_disp_get_default();
+        lv_disp_set_rotation(disp, LV_DISP_ROT_90);
+
+        // Do an initial UI update to show the placeholders
+        updateAllUI();
+    }
+    lvgl_port_unlock();
+
+    Serial.println("Setup complete");
+}
+
+void loop()
+{
+    // Suppose in your real code, you update g_batteryVoltage, etc. here
+    // Then call updateAllUI() each time they change.
+
+    delay(1000);
+    Serial.println("IDLE...");
+}
+
+// -----------------------------------------------------------------------------
+// MAIN UI
+// -----------------------------------------------------------------------------
+
+static void createMainUI()
+{
+    lv_obj_t * mainScreen = lv_obj_create(NULL);
+    lv_scr_load(mainScreen);
+    lv_obj_add_style(mainScreen, &styleScreenBg, 0);
+
+    // Top Bar (optional)
+    lv_obj_t * topBar = lv_obj_create(mainScreen);
+    lv_obj_set_size(topBar, 480, 50);
+    lv_obj_align(topBar, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_pad_all(topBar, 10, 0);
+    lv_obj_set_style_bg_opa(topBar, LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(topBar, lv_color_hex(0x2F2F2F), 0);
+
+    lv_obj_t * titleLbl = lv_label_create(topBar);
+    lv_label_set_text(titleLbl, "ACM Control");
+    lv_obj_align(titleLbl, LV_ALIGN_CENTER, 0, 0);
+
+    // Main container: vertical
+    lv_obj_t * mainContainer = lv_obj_create(mainScreen);
+    lv_obj_set_size(mainContainer, 480, 750);
+    lv_obj_align(mainContainer, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_pad_all(mainContainer, 10, 0);
+
+    lv_obj_set_layout(mainContainer, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(mainContainer, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(mainContainer,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    // Data panels (Battery, Solar, Sensors)
+    // Each call returns a “Value” label pointer. We'll store that in e.g. g_lblBatteryMain
+    createDataPanel(mainContainer, "Battery", &g_lblBatteryMain, batteryDetail_event_cb);
+    createDataPanel(mainContainer, "Solar",   &g_lblSolarMain,   solarDetail_event_cb);
+    createDataPanel(mainContainer, "Sensors", &g_lblSensorMain,  sensorDetail_event_cb);
+
+    // Channels & Inverter
+    lv_obj_t * controls = lv_obj_create(mainContainer);
+    lv_obj_set_size(controls, 460, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(controls, 10, 0);
+    lv_obj_set_layout(controls, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(controls, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(controls,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    // Low Current heading
+    lv_obj_t * lblLC = lv_label_create(controls);
+    lv_label_set_text(lblLC, "Low Current Outputs");
+    lv_obj_set_style_text_font(lblLC, &lv_font_montserrat_18, 0);
+
+    // Container for 8 LC channels
+    lv_obj_t * lcContainer = lv_obj_create(controls);
+    lv_obj_set_size(lcContainer, 440, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(lcContainer, 10, 0);
+    lv_obj_set_layout(lcContainer, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(lcContainer, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(lcContainer,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    for (int i=0; i<8; i++){
+        char label[16];
+        snprintf(label, sizeof(label), "LC%d", i+1);
+        createChannelButton(lcContainer, label);
+    }
+
+    // Medium Current heading
+    lv_obj_t * lblMC = lv_label_create(controls);
+    lv_label_set_text(lblMC, "Medium Current Outputs");
+    lv_obj_set_style_text_font(lblMC, &lv_font_montserrat_18, 0);
+
+    lv_obj_t * mcContainer = lv_obj_create(controls);
+    lv_obj_set_size(mcContainer, 440, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(mcContainer, 10, 0);
+    lv_obj_set_layout(mcContainer, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(mcContainer, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(mcContainer,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    for (int i=0; i<2; i++){
+        char label[16];
+        snprintf(label, sizeof(label), "MC%d", i+1);
+        createChannelButton(mcContainer, label);
+    }
+
+    createInverterButton(mcContainer);
+}
+
+// Creates a data panel with Title + "Value" label, returning a pointer to the label
+static lv_obj_t* createDataPanel(lv_obj_t *parent,
+                                 const char *title,
+                                 lv_obj_t **valueLabelRef,
+                                 lv_event_cb_t event_cb)
+{
+    lv_obj_t * panel = lv_obj_create(parent);
+    lv_obj_set_size(panel, 460, 80);
+    lv_obj_add_style(panel, &stylePanel, 0);
+
+    if(event_cb) {
+        lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(panel, event_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    // Title
+    lv_obj_t * lblTitle = lv_label_create(panel);
+    lv_label_set_text(lblTitle, title);
+    lv_obj_add_style(lblTitle, &stylePanelTitle, 0);
+    lv_obj_align(lblTitle, LV_ALIGN_TOP_LEFT, 10, 5);
+
+    // Value label
+    lv_obj_t * lblValue = lv_label_create(panel);
+    lv_label_set_text(lblValue, ""); // will fill later
+    lv_obj_add_style(lblValue, &stylePanelValue, 0);
+    lv_obj_align(lblValue, LV_ALIGN_BOTTOM_RIGHT, -10, -5);
+
+    if(valueLabelRef) {
+        *valueLabelRef = lblValue;
+    }
+    return panel;
+}
+
+// -----------------------------------------------------------------------------
+// Battery Detail
+// -----------------------------------------------------------------------------
+
+static void batteryDetail_event_cb(lv_event_t * e)
+{
+    openBatteryDetailPopup();
+}
+
+// Creates (or re-creates) the battery detail popup
+static void openBatteryDetailPopup()
+{
+    // If already open, just refresh
+    if (g_batteryOverlay) {
+        refreshBatteryDetailUI();
+        return;
+    }
+
+    // 1) Create a full-screen overlay
+    g_batteryOverlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_batteryOverlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(g_batteryOverlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_batteryOverlay, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(g_batteryOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    fadeInOverlay(g_batteryOverlay);
+
+    // 2) Main detail panel (centered)
+    g_batteryDetailPanel = lv_obj_create(g_batteryOverlay);
+    lv_obj_set_size(g_batteryDetailPanel, 440, 430); // Enough space for arc + 2-column data
+    lv_obj_set_style_radius(g_batteryDetailPanel, 12, 0);
+    lv_obj_set_style_bg_color(g_batteryDetailPanel, lv_color_hex(0x2F2F2F), 0);
+    lv_obj_set_style_bg_opa(g_batteryDetailPanel, LV_OPA_80, 0);
+    lv_obj_align(g_batteryDetailPanel, LV_ALIGN_CENTER, 0, 0);
+
+    // Make the panel a vertical flex layout
+    lv_obj_set_layout(g_batteryDetailPanel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(g_batteryDetailPanel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_batteryDetailPanel,
+                          LV_FLEX_ALIGN_CENTER,  // main alignment (vertical)
+                          LV_FLEX_ALIGN_CENTER,  // cross alignment (horizontal)
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(g_batteryDetailPanel, 10, 0); // add vertical spacing
+
+    // 3) Title at the top
+    lv_obj_t * lblTitle = lv_label_create(g_batteryDetailPanel);
+    lv_label_set_text(lblTitle, "Battery Detail");
+    lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_20, 0);
+
+    // 4) Arc at the top (double-wide ~2 columns, e.g. 300×200)
+    g_batteryArc = lv_arc_create(g_batteryDetailPanel);
+    lv_obj_set_size(g_batteryArc, 300, 200); // Adjust as desired
+    // set arc range, angles, etc. or call your createBatteryArc() + updateBatteryArc() here
+    lv_obj_clear_flag(g_batteryArc, LV_OBJ_FLAG_CLICKABLE);
+
+    // 5) Data container below the arc
+    // We'll arrange 5 data cards (Voltage, Current, Temp, AvgCell, SOC) in 2 columns (row wrap).
+    lv_obj_t * dataContainer = lv_obj_create(g_batteryDetailPanel);
+    lv_obj_set_size(dataContainer, 400, 140); // Enough height so no scrolling
+    lv_obj_set_style_bg_opa(dataContainer, LV_OPA_0, 0);
+
+    // 2-column grid: row wrap with ~2 columns wide. Each card ~180 wide × 60 tall.
+    lv_obj_set_layout(dataContainer, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(dataContainer, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(dataContainer,
+                          LV_FLEX_ALIGN_START,   // main direction
+                          LV_FLEX_ALIGN_CENTER,  // cross direction
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(dataContainer, 10, 0);     // vertical spacing between rows
+    lv_obj_set_style_pad_column(dataContainer, 10, 0);  // horizontal spacing between columns
+
+    // Create your data cards. Each calls createDetailDataCard(... &g_lblBattVoltage, etc.).
+    createDetailDataCard(dataContainer, "Voltage",   &g_lblBattVoltage);
+    createDetailDataCard(dataContainer, "Current",   &g_lblBattCurrent);
+    createDetailDataCard(dataContainer, "Temp",      &g_lblBattTemp);
+    createDetailDataCard(dataContainer, "Avg Cell",  &g_lblBattAvgCell);
+    createDetailDataCard(dataContainer, "SOC(%)",    &g_lblBattPercent);
+
+    // 6) Close button at the bottom
+    lv_obj_t * closeBtn = lv_btn_create(g_batteryDetailPanel);
+    lv_obj_set_size(closeBtn, 80, 40);
+    lv_obj_t * closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "Close");
+    lv_obj_center(closeLbl);
+
+    // On close => remove overlay & references
+    lv_obj_add_event_cb(closeBtn, [](lv_event_t* e){
+        lv_obj_del(g_batteryOverlay);
+        g_batteryOverlay = nullptr;
+        g_batteryDetailPanel = nullptr;
+        g_batteryArc = nullptr;
+        g_lblBattVoltage = nullptr;
+        g_lblBattCurrent = nullptr;
+        g_lblBattTemp = nullptr;
+        g_lblBattAvgCell = nullptr;
+        g_lblBattPercent = nullptr;
+    }, LV_EVENT_CLICKED, nullptr);
+
+    // Populate everything from your existing data
+    refreshBatteryDetailUI();
+}
+
+
+
+// Updates the battery detail UI
+static void refreshBatteryDetailUI()
+{
+    if(!g_batteryDetailPanel) return; // not open
+
+    // Update arc
+    if(g_batteryArc) {
+        updateBatteryArc(g_batteryArc, (int)g_batteryPercent);
+    }
+
+    // Update labels
+    if(g_lblBattVoltage) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.2f V", g_batteryVoltage);
+        lv_label_set_text(g_lblBattVoltage, buf);
+    }
+    if(g_lblBattCurrent) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.2f A", g_batteryCurrent);
+        lv_label_set_text(g_lblBattCurrent, buf);
+    }
+    if(g_lblBattTemp) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f C", g_batteryTemp);
+        lv_label_set_text(g_lblBattTemp, buf);
+    }
+    if(g_lblBattAvgCell) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.2f V", g_batteryAvgCell);
+        lv_label_set_text(g_lblBattAvgCell, buf);
+    }
+    if(g_lblBattPercent) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.0f", g_batteryPercent);
+        lv_label_set_text(g_lblBattPercent, buf);
+    }
+}
+
+// Creates a large battery arc
+static lv_obj_t* createBatteryArc(lv_obj_t* parent, int batteryValue)
+{
+    lv_obj_t * arc = lv_arc_create(parent);
+    // 1) Make sure the arc is in normal mode (not reverse/symmetric)
+    lv_arc_set_mode(arc, LV_ARC_MODE_NORMAL);
+
+    // 2) Rotate the entire arc by 180°, so 0..180 is visually the top half
+    lv_arc_set_rotation(arc, 180);
+
+    // 3) Set the background arc to 0..180
+    //    This means the arc's "full range" is a semi-circle along the top.
+    lv_arc_set_bg_angles(arc, 0, 180);
+
+    // remove click
+    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+
+    // style
+    lv_obj_set_style_arc_width(arc, 25, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arc, 25, LV_PART_MAIN);
+
+    // set initial
+    updateBatteryArc(arc, batteryValue);
+    return arc;
+}
+
+static void updateBatteryArc(lv_obj_t* arc, int batteryValue)
+{
+    lv_arc_set_value(arc, batteryValue);
+
+    int16_t endAngle = 180 + (int16_t)(1.8f * batteryValue);
+    lv_arc_set_angles(arc, 180, endAngle);
+
+    // color logic
+    lv_color_t arcColor = lv_palette_main(LV_PALETTE_GREEN);
+    if (batteryValue < 20) arcColor = lv_palette_main(LV_PALETTE_RED);
+    else if (batteryValue < 50) arcColor = lv_palette_main(LV_PALETTE_YELLOW);
+
+    lv_obj_set_style_arc_color(arc, arcColor, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(0xaaaaaa), LV_PART_MAIN);
+}
+
+// -----------------------------------------------------------------------------
+// Solar Detail
+// -----------------------------------------------------------------------------
+
+static void solarDetail_event_cb(lv_event_t * e)
+{
+    openSolarDetailPopup();
+}
+
+static void openSolarDetailPopup()
+{
+    if(g_solarOverlay) {
+        refreshSolarDetailUI();
+        return;
+    }
+
+    g_solarOverlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_solarOverlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(g_solarOverlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_solarOverlay, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(g_solarOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    fadeInOverlay(g_solarOverlay);
+
+    g_solarDetailPanel = lv_obj_create(g_solarOverlay);
+    lv_obj_set_size(g_solarDetailPanel, 420, 340);
+    lv_obj_set_style_radius(g_solarDetailPanel, 12, 0);
+    lv_obj_set_style_bg_color(g_solarDetailPanel, lv_color_hex(0x2F2F2F), 0);
+    lv_obj_set_style_bg_opa(g_solarDetailPanel, LV_OPA_80, 0);
+    lv_obj_align(g_solarDetailPanel, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t * lblTitle = lv_label_create(g_solarDetailPanel);
+    lv_label_set_text(lblTitle, "Solar Detail");
+    lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_20, 0);
+    lv_obj_align(lblTitle, LV_ALIGN_TOP_MID, 0, 5);
+
+    // A simple vertical layout for data
+    lv_obj_set_layout(g_solarDetailPanel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(g_solarDetailPanel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_solarDetailPanel,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    // Data container
+    lv_obj_t * dataContainer = lv_obj_create(g_solarDetailPanel);
+    lv_obj_set_size(dataContainer, 400, 200);
+    lv_obj_set_style_bg_opa(dataContainer, LV_OPA_0, 0);
+    lv_obj_set_layout(dataContainer, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(dataContainer, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(dataContainer,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    createDetailDataCard(dataContainer, "Voltage",   &g_lblSolarVoltage);
+    createDetailDataCard(dataContainer, "Current",   &g_lblSolarCurrent);
+    createDetailDataCard(dataContainer, "Power",     &g_lblSolarPower);
+    createDetailDataCard(dataContainer, "State",     &g_lblSolarState);
+
+    // Close
+    lv_obj_t * closeBtn = lv_btn_create(g_solarDetailPanel);
+    lv_obj_set_size(closeBtn, 80, 40);
+    lv_obj_align(closeBtn, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    lv_obj_t * closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "Close");
+    lv_obj_center(closeLbl);
+
+    lv_obj_add_event_cb(closeBtn, [](lv_event_t* e){
+        lv_obj_del(g_solarOverlay);
+        g_solarOverlay      = nullptr;
+        g_solarDetailPanel  = nullptr;
+        g_lblSolarVoltage   = nullptr;
+        g_lblSolarCurrent   = nullptr;
+        g_lblSolarPower     = nullptr;
+        g_lblSolarState     = nullptr;
+    }, LV_EVENT_CLICKED, nullptr);
+
+    refreshSolarDetailUI();
+}
+
+static void refreshSolarDetailUI()
+{
+    if(!g_solarDetailPanel) return;
+
+    if(g_lblSolarVoltage) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f V", g_solarVoltage);
+        lv_label_set_text(g_lblSolarVoltage, buf);
+    }
+    if(g_lblSolarCurrent) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f A", g_solarCurrent);
+        lv_label_set_text(g_lblSolarCurrent, buf);
+    }
+    if(g_lblSolarPower) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f W", g_solarPower);
+        lv_label_set_text(g_lblSolarPower, buf);
+    }
+    if(g_lblSolarState) {
+        lv_label_set_text(g_lblSolarState, g_solarState);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sensor Detail
+// -----------------------------------------------------------------------------
+
+static void sensorDetail_event_cb(lv_event_t * e)
+{
+    openSensorDetailPopup();
+}
+
+static void openSensorDetailPopup()
+{
+    if(g_sensorOverlay) {
+        refreshSensorDetailUI();
+        return;
+    }
+
+    g_sensorOverlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(g_sensorOverlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(g_sensorOverlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_sensorOverlay, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(g_sensorOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    fadeInOverlay(g_sensorOverlay);
+
+    g_sensorDetailPanel = lv_obj_create(g_sensorOverlay);
+    lv_obj_set_size(g_sensorDetailPanel, 420, 240);
+    lv_obj_set_style_radius(g_sensorDetailPanel, 12, 0);
+    lv_obj_set_style_bg_color(g_sensorDetailPanel, lv_color_hex(0x2F2F2F), 0);
+    lv_obj_set_style_bg_opa(g_sensorDetailPanel, LV_OPA_80, 0);
+    lv_obj_align(g_sensorDetailPanel, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t * lblTitle = lv_label_create(g_sensorDetailPanel);
+    lv_label_set_text(lblTitle, "Sensor Detail");
+    lv_obj_set_style_text_font(lblTitle, &lv_font_montserrat_20, 0);
+    lv_obj_align(lblTitle, LV_ALIGN_TOP_MID, 0, 5);
+
+    // A small container for data
+    lv_obj_t * dataContainer = lv_obj_create(g_sensorDetailPanel);
+    lv_obj_set_size(dataContainer, 400, 120);
+    lv_obj_set_style_bg_opa(dataContainer, LV_OPA_0, 0);
+    lv_obj_set_layout(dataContainer, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(dataContainer, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(dataContainer,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_align(dataContainer, LV_ALIGN_TOP_MID, 0, 40);
+
+    createDetailDataCard(dataContainer, "Int Temp", &g_lblSensorTemp);
+
+    // Close
+    lv_obj_t * closeBtn = lv_btn_create(g_sensorDetailPanel);
+    lv_obj_set_size(closeBtn, 80, 40);
+    lv_obj_align(closeBtn, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    lv_obj_t * closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "Close");
+    lv_obj_center(closeLbl);
+
+    lv_obj_add_event_cb(closeBtn, [](lv_event_t* e){
+        lv_obj_del(g_sensorOverlay);
+        g_sensorOverlay = nullptr;
+        g_sensorDetailPanel = nullptr;
+        g_lblSensorTemp = nullptr;
+    }, LV_EVENT_CLICKED, nullptr);
+
+    refreshSensorDetailUI();
+}
+
+static void refreshSensorDetailUI()
+{
+    if(!g_sensorDetailPanel) return;
+
+    if(g_lblSensorTemp) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f C", g_sensorTemp);
+        lv_label_set_text(g_lblSensorTemp, buf);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Data Card Helper (blue gradient style card + a label reference)
+// -----------------------------------------------------------------------------
+
+static lv_obj_t* createDetailDataCard(lv_obj_t * parent,
+                                      const char *title,
+                                      lv_obj_t **valueLabelRef)
+{
+    lv_obj_t * card = lv_obj_create(parent);
+    lv_obj_set_size(card, 160, 60);
+    lv_obj_add_style(card, &stylePanel, 0);
+
+    // Title
+    lv_obj_t * lblTitle = lv_label_create(card);
+    lv_label_set_text(lblTitle, title);
+    lv_obj_add_style(lblTitle, &stylePanelTitle, 0);
+    lv_obj_align(lblTitle, LV_ALIGN_TOP_LEFT, 5, 5);
+
+    // Value
+    lv_obj_t * lblValue = lv_label_create(card);
+    lv_label_set_text(lblValue, "");
+    lv_obj_add_style(lblValue, &stylePanelValue, 0);
+    lv_obj_align(lblValue, LV_ALIGN_BOTTOM_RIGHT, -5, -5);
+
+    if(valueLabelRef) {
+        *valueLabelRef = lblValue;
+    }
+    return card;
+}
+
+// -----------------------------------------------------------------------------
+// Channels & Inverter
+// -----------------------------------------------------------------------------
+
+static lv_obj_t* createChannelButton(lv_obj_t *parent, const char *labelText)
+{
+    lv_obj_t * btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 110, 55);
+    lv_obj_set_style_radius(btn, 10, 0);
+
+    lv_obj_add_style(btn, &styleBtnOff, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_style(btn, &styleBtnOn,  LV_PART_MAIN | LV_STATE_CHECKED);
+
+    // Label
+    lv_obj_t * lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, labelText);
+    lv_obj_center(lbl);
+
+    // Start OFF
+    lv_obj_clear_state(btn, LV_STATE_CHECKED);
+
+    // Event
+    lv_obj_add_event_cb(btn, channelBtn_event_cb, LV_EVENT_CLICKED, (void*)labelText);
+    return btn;
+}
+
+static lv_obj_t* createInverterButton(lv_obj_t *parent)
+{
+    lv_obj_t * btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 110, 55);
+    lv_obj_set_style_radius(btn, 10, 0);
+
+    lv_obj_add_style(btn, &styleBtnOff, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_style(btn, &styleBtnOn,  LV_PART_MAIN | LV_STATE_CHECKED);
+
+    lv_obj_t * lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, "Inverter");
+    lv_obj_center(lbl);
+
+    // Start OFF
+    lv_obj_clear_state(btn, LV_STATE_CHECKED);
+
+    lv_obj_add_event_cb(btn, inverterBtn_event_cb, LV_EVENT_CLICKED, NULL);
+    return btn;
+}
+
+static void channelBtn_event_cb(lv_event_t * e)
+{
+    lv_obj_t * btn = lv_event_get_target(e);
+    const char* label = (const char*)lv_event_get_user_data(e);
+
+    bool isOn = lv_obj_has_state(btn, LV_STATE_CHECKED);
+    if(isOn) {
+        // turn off
+        lv_obj_clear_state(btn, LV_STATE_CHECKED);
+        isOn = false;
+    } else {
+        // turn on
+        lv_obj_add_state(btn, LV_STATE_CHECKED);
+        isOn = true;
+    }
+    Serial.printf("%s => %s\n", label, isOn ? "ON" : "OFF");
+}
+
+static void inverterBtn_event_cb(lv_event_t * e)
+{
+    lv_obj_t * btn = lv_event_get_target(e);
+    bool isOn = lv_obj_has_state(btn, LV_STATE_CHECKED);
+
+    if(isOn) {
+        // turn off
+        lv_obj_clear_state(btn, LV_STATE_CHECKED);
+        Serial.println("Inverter => OFF");
+    } else {
+        // turn on
+        lv_obj_add_state(btn, LV_STATE_CHECKED);
+        Serial.println("Inverter => ON");
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Fade-in Overlay
+// -----------------------------------------------------------------------------
+
+static void fadeInOverlay(lv_obj_t * overlay)
+{
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_TRANSP, 0);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, overlay);
+    lv_anim_set_time(&a, 300);
+    lv_anim_set_exec_cb(&a, [](void* obj, int32_t v){
+        lv_obj_set_style_bg_opa((lv_obj_t*)obj, (lv_opa_t)v, 0);
+    });
+    lv_anim_set_values(&a, 0, 150);
+    lv_anim_start(&a);
+}
+
+// -----------------------------------------------------------------------------
+// Real-time UI Update
+// -----------------------------------------------------------------------------
+
+// Called whenever your data changes:
+static void updateAllUI()
+{
+    // 1) Update main screen labels
+    // e.g. "12.6V / 85%"
+    if(g_lblBatteryMain) {
+        static char buf[64];
+        snprintf(buf, sizeof(buf), "%.2fV / %.0f%%", g_batteryVoltage, g_batteryPercent);
+        lv_label_set_text(g_lblBatteryMain, buf);
+    }
+    if(g_lblSolarMain) {
+        static char buf[64];
+        snprintf(buf, sizeof(buf), "%.1fV / %.1fW", g_solarVoltage, g_solarPower);
+        lv_label_set_text(g_lblSolarMain, buf);
+    }
+    if(g_lblSensorMain) {
+        static char buf[64];
+        snprintf(buf, sizeof(buf), "Int Temp: %.1fC", g_sensorTemp);
+        lv_label_set_text(g_lblSensorMain, buf);
+    }
+
+    // 2) If detail popups are open, refresh them
+    refreshBatteryDetailUI();
+    refreshSolarDetailUI();
+    refreshSensorDetailUI();
+}
