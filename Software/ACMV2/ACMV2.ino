@@ -223,7 +223,7 @@ int16_t convertJKTemperature(uint16_t rawVal) {
 float convertJKCurrent(uint16_t rawValBE) {
   bool isCharge = (rawValBE & 0x8000) != 0;
   uint16_t magnitude = (rawValBE & 0x7FFF);
-  float amps = magnitude * 0.1f;
+  float amps = magnitude * 0.01f;
   return isCharge ? amps : -amps;
 }
 
@@ -584,6 +584,9 @@ void parseVictronBlock(char* buffer) {
       }
       else if (strcmp(label, "I") == 0) {
         I = atoi(value);
+        if (I < 0.05) {
+          I = 0;
+        }
       }
       else if (strcmp(label, "VPV") == 0) {
         VPV = atoi(value);
@@ -635,6 +638,8 @@ void parseVictronBlock(char* buffer) {
 // ----------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
+    Serial1.begin(19200, SERIAL_8N1, 9, 8);
+    Serial.println("Serial1 (Victron) initialized at 19200 baud");
 
     // BMS Serial2 at 115200
     SerialBMS.begin(115200, SERIAL_8N1, U2_RX, U2_TX);
@@ -755,7 +760,7 @@ void loop() {
     while (Serial1.available()) {
         char incomingByte = Serial1.read();
         checksumSum += static_cast<unsigned char>(incomingByte);
-
+        // Serial.println(incomingByte);
         if (blockIndex < MAX_BLOCK_SIZE - 1) {
             blockBuffer[blockIndex++] = incomingByte;
             lastSerialDataMillis = millis();
@@ -844,9 +849,9 @@ void sendSensorData() {
     // Voltage & Current:
     String batteryVoltageHex = floatToHex(batteryVoltage, 100);
     String cellAvgHex = floatToHex(avgCellVoltage, 100);
-    // totalCurrent is from your readQuadCurrent & readDualCurrent sums
+    // totalCurrent is from readQuadCurrent & readDualCurrent sums
     // bmsCurrent is A*10 ie -4 A -> 40.00
-    String currentUsageBMSHex = floatToHex(bmsCurrent, 10);
+    String currentUsageBMSHex = floatToHex(bmsCurrent + 512, 10);
     // Serial.println(bmsCurrent);
     String currentUsageHex = floatToHex(totalCurrent, 100);
     // Solar from your code:
@@ -854,6 +859,7 @@ void sendSensorData() {
     String solarCurrentHex = floatToHex(I, 100);
     String solarPowerHex = floatToHex(PPV, 100);
     String solarStateHex = floatToHex(CS, 1);
+    Serial.println(bmsCurrent);
 
     String batTemp1Hex = floatToHex(batTemp1, 100);
 
@@ -866,6 +872,7 @@ void sendSensorData() {
 
     // Victron connection flag:
     String connectionFlag = serialConnectionActive ? "1" : "0";
+    // Serial.println(serialConnectionActive);
 
     // **Add BMS flag**:
     String bmsFlag = bmsConnected ? "1" : "0";
